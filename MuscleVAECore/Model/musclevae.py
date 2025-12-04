@@ -433,5 +433,190 @@ class MuscleVAE(nn.Module):
         self.world_model.load_state_dict(wm_dict)
         return data
 
+
+
+
+    #--------------------------------Training submodule-------------------------------#
     
+    def train_policy(self, states, targets, target_scaled_muscle_len, muscle_states):
+        """
+        states:                [B, T, state_dim]
+        targets:               [B, T, obs_dim]             # rigid BodyInfo obs
+        target_scaled_ml:      [B, T, muscle_len_dim]      # target scaled muscle lengths
+        muscle_states:         [B, T, muscle_state_dim]    # fatigue proportions (used only for WM input)
+        """
+        rollout_length = states.shape[1]
+
+        loss_name = ['pos', 'rot', 'vel', 'avel', 'height', 'up_dir',
+                    'acs', 'scaled_ml', 'kl']
+        loss_num  = len(loss_name)
+        loss      = [[] for _ in range(loss_num)]
+
+        # [T, B, ...]
+        states               = states.transpose(0, 1).contiguous().to(ptu.device)
+        targets              = targets.transpose(0, 1).contiguous().to(ptu.device)
+        target_scaled_ml     = target_scaled_muscle_len.transpose(0, 1).contiguous().to(ptu.device)
+        muscle_states        = muscle_states.transpose(0, 1).contiguous().to(ptu.device)
+
+        cur_state        = states[0]
+        cur_muscle_state = muscle_states[0]
+
+        # initial obs & normalization (rigid only)
+        cur_observation = state2ob(cur_state)
+        n_observation   = self.normalize_target(cur_observation)
+
+        for t in range(rollout_length):
+            target      = targets[t]
+            target_ml   = target_scaled_ml[t]
+
+            # act_tracking doesn't include muscles, so this is a patch that encodes/decodes muscle obs as well
+            """action, info = self.act_tracking(
+                n_observation=n_observation,
+                target=target
+            )"""
+            enc_inp = torch.cat([n_observation, cur_muscle_state], dim=-1) if self.use_muscle_state else n_observation
+            n_target = self.normalize_target(target)
+            latent, mu_post, mu_prior = self.encode(enc_inp, n_target)
+            
+            action = self.decode(enc_inp, latent)
+            info = {
+                "mu_prior": mu_prior,
+                "mu_post": mu_post
+            }
+
+            action = action + torch.randn_like(action) * self.action_sigma
+
+            # rollout world model (returns new rigid state + new muscle fatigue state)
+            cur_state, cur_muscle_state = self.world_model(
+                cur_state, action, muscle_state=cur_muscle_state
+            )
+
+            # recompute obs for loss & next step
+            cur_observation = state2ob(cur_state)
+            n_observation   = self.normalize_target(cur_observation)
+
+            # current scaled muscle lengths (from predicted state)
+            with torch.no_grad():
+                # cur_state: [B, num_body, 13]
+                np_states = cur_state.detach().cpu().numpy()   # (B, num_body, 13)
+                B = np_states.shape[0]
+                ml_list = []
+                for b in range(B):
+                    # for each sample, pass its [num_body, 13] state
+                    ml_b = np_state2scaled_muscle_length(
+                        np_states[b].reshape(-1, 13),
+                        self.env.sim_character
+                    )   # shape (284,)
+                    ml_list.append(ml_b.astype(np.float32))
+                cur_scaled_ml_np = np.stack(ml_list, axis=0)   # [B, 284]
+
+            input_scaled_ml = ptu.from_numpy(cur_scaled_ml_np).to(cur_state.device)  # [B, 284]
+
+            # pose + muscle imitation loss
+            pos_loss, rot_loss, vel_loss, avel_loss, height_loss, up_dir_loss, ml_loss = \
+                pose_err_with_muscle(
+                    cur_observation,
+                    input_scaled_ml,
+                    target,
+                    target_ml,
+                    self.weight,
+                    dt=self.env.dt
+                )
+
+            loss[0].append(pos_loss)
+            loss[1].append(rot_loss)
+            loss[2].append(vel_loss)
+            loss[3].append(avel_loss)
+            loss[4].append(height_loss)
+            loss[5].append(up_dir_loss)
+            loss[7].append(ml_loss)  # index of 'scaled_ml'
+
+            # action regularization
+            acs_loss = self.weight['l2'] * torch.mean(torch.sum(action**2, dim=-1)) \
+                    + self.weight['l1'] * torch.mean(torch.norm(action, p=1, dim=-1))
+            loss[6].append(acs_loss)  # 'acs'
+
+            # KL loss
+            kl_loss = self.encoder.kl_loss(**info)    # [B, latent_dim]
+            kl_loss = torch.mean(torch.sum(kl_loss, dim=-1))
+            loss[8].append(kl_loss * self.beta_scheduler.value)  # 'kl'
+
+        # gamma temporal discounting as in ControlVAE
+        discount = 0.95
+        loss_value = [
+            sum((discount ** i) * l[i] for i in range(rollout_length)) / rollout_length
+            for l in loss
+        ]
+        loss_total = sum(loss_value)
+
+        self.vae_optimizer.zero_grad()
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1, error_if_nonfinite=True)
+        torch.nn.utils.clip_grad_norm_(self.agent.parameters(),   1, error_if_nonfinite=True)
+        self.vae_optimizer.step()
+        self.beta_scheduler.step()
+
+        res = {loss_name[i]: loss_value[i] for i in range(loss_num)}
+        res['beta'] = self.beta_scheduler.value
+        res['loss'] = loss_total
+        return res
+
+
+    def train_world_model(self, states, actions, muscle_states):
+        """
+        states:        [B, T+1, state_dim]         # rigid state (13 * num_bodies)
+        actions:       [B, T,   act_dim]
+        muscle_states: [B, T+1, muscle_state_dim]  # fatigue proportions
+        """
+        rollout_length = states.shape[1] - 1
+
+        loss_name = ['pos', 'rot', 'vel', 'avel', 'ms_fatigue']
+        loss_num  = len(loss_name)
+        loss      = [[] for _ in range(loss_num)]
+
+        # [T+1, B, ...] etc.
+        states        = states.transpose(0, 1).contiguous().to(ptu.device)
+        actions       = actions.transpose(0, 1).contiguous().to(ptu.device)
+        muscle_states = muscle_states.transpose(0, 1).contiguous().to(ptu.device)
+
+        cur_state        = states[0]
+        cur_muscle_state = muscle_states[0]
+
+        for t in range(rollout_length):
+            next_state        = states[t + 1]
+            next_muscle_state = muscle_states[t + 1]
+
+            # world model predicts next rigid state + next muscle_state
+            pred_next_state, pred_muscle_state = self.world_model(
+                cur_state, actions[t], muscle_state=cur_muscle_state
+            )
+
+            # muscle-aware loss defined in the SimpleWorldModel
+            pos_loss, rot_loss, vel_loss, avel_loss, ms_loss = \
+                self.world_model.loss_with_muscle_fatigue_state(
+                    pred_next_state, next_state,
+                    pred_muscle_state, next_muscle_state
+                )
+
+            loss[0].append(pos_loss)
+            loss[1].append(rot_loss)
+            loss[2].append(vel_loss)
+            loss[3].append(avel_loss)
+            loss[4].append(ms_loss)
+
+            cur_state        = pred_next_state
+            cur_muscle_state = pred_muscle_state
+
+        loss_value = [sum(l) for l in loss]
+        loss_total = sum(loss_value)
+
+        self.wm_optimizer.zero_grad()
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1, error_if_nonfinite=True)
+        self.wm_optimizer.step()
+
+        res = {loss_name[i]: loss_value[i] for i in range(loss_num)}
+        res['loss'] = loss_total
+        return res
+
     
