@@ -63,8 +63,34 @@ python ./PlayGround/visualize_world_model.py --start_frame 6000
 
 ## Training
 
-Till now, we only offer the playing codes. The training codes will come soon.
+To train, please provide `train_musclevae.py` with a working `config.yml` at line 75. 
+You can copy the settings from the `low_level/config.yml`, just make sure to replace the `motion_dataset` param with your actual `.pickle` file.
 
+### Parallel Training:
+To train in parallel, use `anaconda prompt` in the root dir, with the following command(replace the 4 with how many parallel envs you might want to use):
+```
+mpiexec -n 4 python train_musclevae.py
+```
+### Loading training from a save:
+To load from a previous `config` and `.data` file(you'll need to provide them from the file dialog):
+```
+mpiexec -n 4 python train_musclevae.py --load
+```
+### Training times:
+
+For an `Intel Core I7-11700K 3,60GHz` and an `NVIDIA RTX 3060 12GB` on `4 parallel threads`:
+- iterations per minute: 4,16
+- time to 2.000 iterations: 8 hours
+- time to 20k iterations: 80 hours
+- training speed compared to controlvae: 1,6 time slower
+  
+### Notes:
+
+##### Note 1: there's a current bug in the code where the beta_kl annealer updates every 500 iterations instead of the paper's mentioned 4000, even though it's native in the repo's, so it's recommended to stick to it.
+
+##### Note 2: At the current time loading a `.data` file resets the beta_kl annealer value, it doesn't seem to be a problem in most cases, but patching it might be ideal if you plan on taking multiple breaks while training.
+
+##### Note 3: The paper mentions taking a week to train on 25 minutes of mocap on 6 threads, however it seems like the original dataset wasn't actually trained in parallel.
 
 ## Citing
 
