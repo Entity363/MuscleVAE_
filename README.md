@@ -82,7 +82,10 @@ For an `Intel Core I7-11700K 3,60GHz` and an `NVIDIA RTX 3060 12GB` on `4 parall
 - iterations per minute: 4,16
 - time to 2.000 iterations: 8 hours
 - time to 20k iterations: 80 hours
-- training speed compared to controlvae: 1,6 time slower
+- training speed compared to [ControlVAE](https://github.com/heyuanYao-pku/Control-VAE/): 1,6 time slower
+
+### Training High Level Tasks:
+For training high level tasks such as walking, throwing or other skill-controlled systems, please refer to [ControlVAE](https://github.com/heyuanYao-pku/Control-VAE/).
   
 ### Notes:
 
