@@ -85,7 +85,8 @@ For an `Intel Core I7-11700K 3,60GHz` and an `NVIDIA RTX 3060 12GB` on `4 parall
 - training speed compared to [ControlVAE](https://github.com/heyuanYao-pku/Control-VAE/): 1,6 time slower
 
 ### Training High Level Tasks:
-For training high level tasks such as walking, throwing or other skill-controlled systems, please refer to [ControlVAE](https://github.com/heyuanYao-pku/Control-VAE/).
+For training the speed control task please refer to `Playground/velocity_control.py`. Remember to lower `save_period` as speed control only takes about `100 iterations` to complete.
+You can find the results in `Experiment/playground`.
   
 ### Notes:
 
