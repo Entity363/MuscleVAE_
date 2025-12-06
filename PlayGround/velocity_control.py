@@ -5,7 +5,7 @@ from MuscleVAECore.Utils.misc import load_data, load_yaml
 from MuscleVAECore.Utils.motion_utils import state2ob
 from MuscleVAECore.Utils.pytorch_utils import build_mlp
 from MuscleVAECore.Utils.radam import RAdam
-from PlayGround.playground_util import get_root_facing
+from PlayGround.playground_util import get_root_facing, state2speed
 from random_generation import RandomPlayground
 import MuscleVAECore.Utils.pytorch_utils as ptu
 import torch
@@ -14,6 +14,9 @@ import types
 from scipy.spatial.transform import Rotation
 import psutil
 import MuscleVAECore.Utils.pytorch_utils as ptu
+
+import math
+import keyboard
 
 from mpi4py import MPI
 from collections import deque
@@ -32,6 +35,50 @@ def speed_target(self):
     if not hasattr(self, 'target') or self.target is None:
         self.target = random_target(self)
     return self.target
+
+
+def hand_control_wasd():
+    """
+    Read WASD keys and return angle and velocity norm.
+    Angle is in radians, 0 = facing right (x+), counterclockwise positive.
+    Velocity norm is the speed magnitude (0 if no keys pressed).
+    """
+
+    # Directions mapped to x,y
+    x_dir = 0
+    y_dir = 0
+
+    running = False
+
+    if keyboard.is_pressed('w'):
+        y_dir += 1
+    if keyboard.is_pressed('s'):
+        y_dir -= 1
+    if keyboard.is_pressed('a'):
+        x_dir += 1
+    if keyboard.is_pressed('d'):
+        x_dir -= 1
+    if keyboard.is_pressed('shift'):
+        running = True
+    else:
+        running = False
+
+    # If no input, no movement
+    if x_dir == 0 and y_dir == 0:
+        return 0, 0
+
+    # Calculate angle from vector
+    angle = math.atan2(y_dir, x_dir)
+
+    # Normalize velocity magnitude (can be scaled)
+    velo_norm = math.sqrt(x_dir**2 + y_dir**2)
+    if running == True:
+        max_speed = 3.0  # max speed value you want
+    else:
+        max_speed = 1.0
+    velo_norm = min(velo_norm, 1) * max_speed  # max speed capped at max_speed
+
+    return angle, velo_norm
 
 
 def hand_control_1_minute(self):
@@ -106,15 +153,15 @@ def after_step(self, **kargs):
         if self.step_cnt % self.random_count == 0:
             self.target = random_target(self)
     else:
-        angle, velo_norm = hand_control_1_minute(self)
+        angle, velo_norm = hand_control_wasd() #hand_control_1_minute(self)
         res = np.array([velo_norm, angle])
         self.target = res
 
 
 
 def after_substep(self):
-    self.interactor.time_step += 1
-
+    #self.interactor.time_step += 1
+    pass
 
 
 class SpeedPlayground(RandomPlayground):
@@ -161,7 +208,7 @@ class SpeedPlayground(RandomPlayground):
                 self.env.arrow.is_enable = False
                 self.env.arrow = self.env.arrow.root_body
                 self.env.base_rotation = Rotation.from_rotvec(np.array([-np.pi/2,0,0]))
-                self.env.interactor = self
+                #self.env.interactor = self
                 
 
 
@@ -190,6 +237,7 @@ class SpeedPlayground(RandomPlayground):
                     'high_level_optim': self.high_level_optim.state_dict(),
                 }
             import os
+            print("saved on velocity")
             torch.save(check_point, os.path.join(self.data_dir_name,f'{iteration}.data'))
 
     def try_load(self, data_file):
@@ -232,7 +280,7 @@ class SpeedPlayground(RandomPlayground):
         
     
     #------------------------------------------acting-------------------------------#
-    def act_task(self, **obs_info):
+    def act_task_old(self, **obs_info):
         n_observation = self.obsinfo2n_obs(obs_info)
         latent, mu, _ = self.encoder.encode_prior(n_observation)    
         n_target = self.target2n_target(obs_info['state'], obs_info['target'])
@@ -253,12 +301,245 @@ class SpeedPlayground(RandomPlayground):
             'latent': latent,
             'offset': offset
         }
+    #------------------------------------------acting-------------------------------#
+    def act_task_old(self, **obs_info):
+        
+        n_observation = self.obsinfo2n_obs(obs_info)
+        latent, mu, _ = self.encoder.encode_prior(n_observation)    
+        n_target = self.target2n_target(obs_info['state'], obs_info['target'])
+        
+        task = torch.cat([n_observation, n_target], dim=1)
+        offset = self.high_level(task)
+        if self.dance:
+            if n_target[...,2].abs()<0.5:
+                latent = latent
+            else:
+                latent = latent + offset
+        else:
+            latent = mu+offset
+        
+        action = self.decode(n_observation, latent)
+        return action, {
+            'mu': mu,
+            'latent': latent,
+            'offset': offset
+        }
+    def act_task(self, **obs_info):
+        """
+        High-level policy for MuscleVAE:
+        - input: normalized rigid obs (+ optional muscle_state), + target [speed, heading]
+        - output: muscle actions via encoder + high_level + decoder
+        """
+
+        # 1) Get normalized rigid observation (371-dim)
+        if 'n_observation' in obs_info:
+            n_observation = obs_info['n_observation']        # [B, 371] or [1, 371]
+        else:
+            if 'observation_rigid' in obs_info:
+                cur_observation = obs_info['observation_rigid']
+            else:
+                cur_observation = state2ob(obs_info['state'])
+            # For MuscleVAE use normalize_target 
+            n_observation = self.normalize_target(cur_observation)
+
+        if isinstance(n_observation, np.ndarray):
+            n_observation = ptu.from_numpy(n_observation)
+        if n_observation.dim() == 1:
+            n_observation = n_observation.unsqueeze(0)       # → [1, 371]
+        n_observation = n_observation.to(ptu.device)
+
+        # 2) Append muscle_state if available (to reach 386 dims)
+        muscle_state = obs_info.get('muscle_state', None)
+        if self.env.use_muscle_state and muscle_state is not None:
+            # to tensor
+            if isinstance(muscle_state, np.ndarray):
+                muscle_state = ptu.from_numpy(muscle_state)
+            muscle_state = muscle_state.to(
+                n_observation.device, dtype=n_observation.dtype
+            )
+
+            # ensure [B, ms_dim]
+            if muscle_state.dim() == 1:
+                muscle_state = muscle_state.unsqueeze(0)      # [1, ms_dim]
+
+            # fix batch mismatch like [1,ms_dim] vs [B,371]
+            if muscle_state.shape[0] != n_observation.shape[0]:
+                if muscle_state.shape[0] == 1:
+                    muscle_state = muscle_state.expand(
+                        n_observation.shape[0], -1
+                    )
+                else:
+                    raise RuntimeError(
+                        f"act_task: batch mismatch: n_observation {n_observation.shape}, "
+                        f"muscle_state {muscle_state.shape}"
+                    )
+
+            enc_inp = torch.cat([n_observation, muscle_state], dim=-1)  # [B, 386]
+        else:
+            enc_inp = n_observation  # [B, 371] if muscle state is disabled
+
+        # 3) Prior encoder on full obs (386) – matches Linear(386,512)
+        latent, mu, _ = self.encoder.encode_prior(enc_inp)
+
+        # 4) Task input: obs + target → 386 + 3 = 389 dims
+        n_target = self.target2n_target(
+            obs_info['state'], obs_info['target']
+        )  # [B, 3]
+        if isinstance(n_target, np.ndarray):
+            n_target = ptu.from_numpy(n_target).to(enc_inp.device)
+        if n_target.dim() == 1:
+            n_target = n_target.unsqueeze(0)
+
+        task = torch.cat([enc_inp, n_target], dim=1)  # [B, self.task_ob_size]
+
+        offset = self.high_level(task)
+        if self.dance:
+            if n_target[..., 2].abs() < 0.5:
+                latent = latent
+            else:
+                latent = latent + offset
+        else:
+            latent = mu + offset
+
+        # 5) Decode using the same enc_inp that encoder saw
+        action = self.decode(enc_inp, latent)
+
+        return action, {
+            'mu': mu,
+            'latent': latent,
+            'offset': offset,
+        }
+
+
+
     
     def act_determinastic(self, obs_info):
         return self.act_task(**obs_info)[0]
     
+    #------------------------------------------training-------------------------------#
+    @property
+    def high_level_data_name_list(self):
+        return ['state', 'target', 'muscle_state']
     
     
+    
+    def train_one_step(self):
+        
+        name_list = self.high_level_data_name_list
+        rollout_length = 16
+        # self.sub_iter = 2
+        data_loader = self.replay_buffer.\
+            generate_data_loader(   name_list,
+                                    rollout_length,
+                                    self.musclevae_batch_size,
+                                    self.sub_iter
+                                )
+        for batch in data_loader:
+            log = self.train_high_level(*batch)
+        self.scheduler.step()
+        return log
+
+    
+    def get_loss(self, state, target):
+        direction = get_root_facing(state)
+        delta_angle = torch.atan2(direction[:, 2], direction[:, 0]) - target[:, 1]
+        direction_loss = torch.acos(
+            torch.cos(delta_angle).clamp(min=-1+1e-4, max=1-1e-4)
+        ) / torch.pi
+        
+        com_vel = state2speed(state, self.mass)
+        target_direction = torch.cat(
+            [torch.cos(target[:, 1, None]), torch.sin(target[:, 1, None])],
+            dim=-1
+        )
+
+        # if speed == 0 use |v|_1, otherwise project on target direction
+        com_vel_proj = torch.where(
+            target[:, 0] == 0,
+            torch.norm(com_vel, dim=-1, p=1),
+            torch.einsum('bi,bi->b', com_vel[:, [0, 2]], target_direction)
+        )
+
+        speed_loss = torch.abs(com_vel_proj - target[:, 0]) / target[:, 0].clamp(min=1)
+        
+        fall_down_loss = torch.clamp(state[..., 0, 1], min=0, max=0.6)
+        fall_down_loss = (0.6 - fall_down_loss)
+        fall_down_loss = torch.mean(fall_down_loss)
+
+        return direction_loss.mean(), speed_loss.mean(), fall_down_loss
+    
+    def train_high_level(self, states, targets, muscle_states):
+        """
+        states:        [B, T, state_dim]
+        targets:       [B, T, 2]   # [speed, heading]
+        muscle_states: [B, T, ms_dim]
+        """
+        rollout_length = states.shape[1]
+
+        states        = states.to(ptu.device)
+        targets       = targets.to(ptu.device)
+        muscle_states = muscle_states.to(ptu.device)
+
+        # initial state
+        cur_state        = states[:, 0]        # [B, state_dim]
+        cur_muscle_state = muscle_states[:, 0] # [B, ms_dim]
+
+        cur_observation = state2ob(cur_state)
+        n_observation   = self.normalize_target(cur_observation)  # ← use normalize_obs here
+
+        loss_name = ['direction', 'speed', 'fall_down', 'acs']
+        loss_num  = len(loss_name)
+        loss      = [[] for _ in range(loss_num)]
+
+        for i in range(rollout_length):
+            # ---- 1) High-level action via act_task (same as ControlVAE) ----
+            action, info = self.act_task(
+                state=cur_state,
+                target=targets[:, i],
+                n_observation=n_observation,
+                muscle_state=cur_muscle_state,
+            )
+
+            # ---- 2) World model rollout (muscle-aware) ----
+            # NOTE: MuscleVAE world_model returns (state, muscle_state)
+            cur_state, cur_muscle_state = self.world_model(
+                cur_state,
+                action,
+                muscle_state=cur_muscle_state
+            )
+
+            # ---- 3) Update observation for next step ----
+            cur_observation = state2ob(cur_state)
+            n_observation   = self.normalize_target(cur_observation)
+
+            # ---- 4) Task losses ----
+            d_loss, s_loss, f_loss = self.get_loss(cur_state, targets[:, i])
+            loss[0].append(d_loss)
+            loss[1].append(s_loss)
+            loss[2].append(f_loss)
+
+            # ---- 5) Action regularization on info['offset'] ----
+            action_loss = torch.mean(info['offset'] ** 2)
+            loss[3].append(action_loss)
+
+        # ---- 6) Temporal averaging + weighting ----
+        weight = [1, 0, 100, 20]
+        loss_value = [sum(l) / rollout_length * weight[i] for i, l in enumerate(loss)]
+        loss_value[0] = loss[0][-1]  # direction: only last step
+
+        total_loss = sum(loss_value)
+
+        # ---- 7) Optimize high_level only ----
+        self.high_level_optim.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.high_level.parameters(), 1)
+        self.high_level_optim.step()
+
+        res = {loss_name[i]: loss_value[i] for i in range(loss_num)}
+        res['loss'] = total_loss
+        return res
+
+        
     #------------------------------------------playing-------------------------------#
     def get_action(self, **obs_info):
         return self.act_task(**obs_info)
@@ -320,8 +601,21 @@ if __name__ == "__main__":
     action_sz = muscle_action 
     playground = SpeedPlayground(observation_sz, rigid_observation_sz, action_sz, 138, env, **args)
     
+    args['mode'] = 'drawstuff'
+    args['start_frame'] = 1
+
+    args['train'] = False
     
+    args['save_period'] = 20
+
+
     print("in joystick ground 'env_step_mode'",args['env_step_mode'])
     print("in joystick ground 'experiment_name'",args['experiment_name'])
-    playground.try_load(data_file)
-    playground.run(0)
+    if args['train'] == True:
+        # load controlvae
+        super(SpeedPlayground, playground).try_load(data_file)    
+        playground.save_before_train(args)
+        playground.train_loop()
+    else:
+        playground.try_load(data_file)
+        playground.run(args['start_frame'])
